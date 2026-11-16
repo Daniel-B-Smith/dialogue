@@ -48,6 +48,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.SocketException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.Arrays;
@@ -66,6 +67,7 @@ import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.core5.function.Supplier;
 import org.apache.hc.core5.http.ClassicHttpRequest;
+import org.apache.hc.core5.http.EndpointDetails;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.NoHttpResponseException;
@@ -82,6 +84,12 @@ final class ApacheHttpClientBlockingChannel implements BlockingChannel {
      * connection/handshake churn.
      */
     private static final int REMAINING_CONTENT_CONNECTION_DISCARD_THRESHOLD = 64 * 1024;
+
+    /**
+     * Failures this soon after sending a request on a pooled connection are taken to mean the connection was already
+     * closed. Larger than the expected couple of milliseconds to allow for long garbage collection pauses.
+     */
+    private static final long STALE_CONNECTION_FAILURE_THRESHOLD_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     private final ApacheHttpClientChannels.CloseableClient client;
     private final BaseUrl baseUrl;
@@ -104,10 +112,64 @@ final class ApacheHttpClientBlockingChannel implements BlockingChannel {
 
     @Override
     public Response execute(Endpoint endpoint, Request request) throws IOException {
+        HttpClientContext context = HttpClientContext.create();
+        long startTime = System.nanoTime();
+        try {
+            return executeOnce(endpoint, request, context);
+        } catch (NoHttpResponseException | SocketException e) {
+            // Like the NoHttpResponseException handling below, only a failure soon after sending can be told apart
+            // from a server that processed the request for a while before its connection was lost.
+            if (System.nanoTime() - startTime >= STALE_CONNECTION_FAILURE_THRESHOLD_NANOS
+                    || !failedBeforeResponseOnReusedConnection(context)) {
+                throw e;
+            }
+            // A pooled connection was dead, e.g. because the server restarted. Every connection pooled to that
+            // server is then usually dead too, and connections idle for less than the server's keep-alive timeout
+            // are reused without validation, so later requests, including the caller's retries, could each lease
+            // another dead connection. Have the pool validate connections pooled before now.
+            client.connectionConfigResolver().markPooledConnectionsSuspect();
+            if (!isRepeatable(request)) {
+                throw e;
+            }
+            // Resend once, on a live or new connection. This follows RFC 9110 section 9.2.2: a client may retry
+            // automatically when "the underlying transport connection closed before any part of a response is
+            // received, particularly if an idle persistent connection was used", and "SHOULD NOT automatically
+            // retry a failed automatic retry".
+            if (log.isDebugEnabled()) {
+                log.debug(
+                        "Resending a request after a pooled connection was found dead",
+                        SafeArg.of("client", client.name()),
+                        SafeArg.of("serviceName", endpoint.serviceName()),
+                        SafeArg.of("endpointName", endpoint.endpointName()),
+                        e);
+            }
+            try {
+                return executeOnce(endpoint, request, HttpClientContext.create());
+            } catch (IOException | RuntimeException | Error retryFailure) {
+                retryFailure.addSuppressed(e);
+                throw retryFailure;
+            }
+        }
+    }
+
+    /**
+     * True if the request failed on a connection that had already completed an earlier exchange, before any part of
+     * a response to this request was received, i.e. the connection was dead when it was leased from the pool.
+     * Failures to establish a new connection are excluded: a new connection has no earlier responses.
+     */
+    private static boolean failedBeforeResponseOnReusedConnection(HttpClientContext context) {
+        EndpointDetails endpointDetails = context.getEndpointDetails();
+        return endpointDetails != null && endpointDetails.getResponseCount() > 0;
+    }
+
+    private static boolean isRepeatable(Request request) {
+        return request.body().map(RequestBody::repeatable).orElse(true);
+    }
+
+    private Response executeOnce(Endpoint endpoint, Request request, HttpClientContext context) throws IOException {
         long startTime = System.nanoTime();
         try {
             ClassicHttpRequest httpRequest = createRequest(baseUrl, endpoint, request);
-            HttpClientContext context = HttpClientContext.create();
             resolvedHost.ifPresent(inetAddress -> DialogueRoutePlanner.set(context, inetAddress));
             @SuppressWarnings("for-rollout:deprecation")
             CloseableHttpResponse httpClientResponse = client.apacheClient().execute(httpRequest, context);
@@ -141,7 +203,7 @@ final class ApacheHttpClientBlockingChannel implements BlockingChannel {
             // to account for large garbage collections.
             long durationNanos = System.nanoTime() - startTime;
             Arg<?>[] diagnosticArgs = failureDiagnosticArgs(endpoint, request, startTime);
-            if (durationNanos < TimeUnit.SECONDS.toNanos(5)) {
+            if (durationNanos < STALE_CONNECTION_FAILURE_THRESHOLD_NANOS) {
                 e.addSuppressed(new Diagnostic(diagnosticArgs));
                 throw e;
             }

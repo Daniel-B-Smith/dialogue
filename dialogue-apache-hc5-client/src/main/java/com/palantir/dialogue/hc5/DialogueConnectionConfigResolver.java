@@ -16,6 +16,7 @@
 
 package com.palantir.dialogue.hc5;
 
+import java.util.concurrent.TimeUnit;
 import org.apache.hc.client5.http.HttpRoute;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.core5.function.Resolver;
@@ -42,12 +43,25 @@ final class DialogueConnectionConfigResolver implements Resolver<HttpRoute, Conn
     private static final TimeValue CONNECTION_INACTIVITY_CHECK = TimeValue.ofMilliseconds(
             Integer.getInteger("dialogue.experimental.inactivity.check.threshold.millis", 4_000));
 
+    /**
+     * Upper bound on how long connections pooled before a stale-connection failure stay suspect when inactivity
+     * validation is otherwise disabled. Pooled connections do not outlive the server's keep-alive timeout, so this
+     * only needs to cover that.
+     */
+    private static final long MAX_SUSPECT_WINDOW_MILLIS = TimeUnit.MINUTES.toMillis(10);
+
     private final Timeout connectTimeout;
     private final Timeout socketTimeout;
 
     // We create a new connectionConfig when the connectionInactivityCheck interval changes
     // to avoid allocating a new ConnectionConfig each time the value is queried.
     private volatile ConnectionConfig connectionConfig;
+
+    /**
+     * Wall-clock time in milliseconds, the clock the pool uses for idle times, of the most recent failure showing
+     * that connections pooled before it may be dead (see {@link #markPooledConnectionsSuspect()}), or 0 if none.
+     */
+    private volatile long pooledConnectionsSuspectBeforeMillis = 0;
 
     DialogueConnectionConfigResolver(Timeout connectTimeout, Timeout socketTimeout) {
         this.connectTimeout = connectTimeout;
@@ -67,8 +81,38 @@ final class DialogueConnectionConfigResolver implements Resolver<HttpRoute, Conn
         return connectionConfig.getValidateAfterInactivity();
     }
 
+    /**
+     * Called when a pooled connection turned out to be dead, e.g. because the server restarted. When that happens
+     * every connection pooled to that server is usually dead too, but the pool only validates connections idle for
+     * longer than {@link #getValidateAfterInactivity()}, which a server's {@code Keep-Alive} header can raise to
+     * minutes. Until then, connections last used before this call are validated before they are reused, so a
+     * request leases a live or new connection instead of the next dead one.
+     */
+    void markPooledConnectionsSuspect() {
+        pooledConnectionsSuspectBeforeMillis = System.currentTimeMillis();
+    }
+
     @Override
     public ConnectionConfig resolve(HttpRoute _ignored) {
-        return connectionConfig;
+        ConnectionConfig current = connectionConfig;
+        long suspectBefore = pooledConnectionsSuspectBeforeMillis;
+        if (suspectBefore == 0) {
+            return current;
+        }
+        long sinceSuspectMillis = Math.max(0, System.currentTimeMillis() - suspectBefore);
+        TimeValue validateAfterInactivity = current.getValidateAfterInactivity();
+        long windowMillis = TimeValue.isNonNegative(validateAfterInactivity)
+                ? validateAfterInactivity.toMilliseconds()
+                : MAX_SUSPECT_WINDOW_MILLIS;
+        if (sinceSuspectMillis >= windowMillis) {
+            // Every connection last used before the failure has been idle long enough to be validated anyway.
+            return current;
+        }
+        // The pool validates a connection whose last use is more than this long ago, i.e. before the failure.
+        return ConnectionConfig.custom()
+                .setValidateAfterInactivity(TimeValue.ofMilliseconds(sinceSuspectMillis))
+                .setConnectTimeout(connectTimeout)
+                .setSocketTimeout(socketTimeout)
+                .build();
     }
 }

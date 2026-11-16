@@ -181,6 +181,7 @@ public final class ApacheHttpClientChannels {
                 CloseableHttpClient apacheClient,
                 @Safe String clientName,
                 InstrumentedPoolingHttpClientConnectionManager pool,
+                DialogueConnectionConfigResolver connectionConfigResolver,
                 ScheduledFuture<?> connectionEvictorFuture,
                 ClientConfiguration clientConfiguration,
                 @Nullable ExecutorService executor) {
@@ -190,6 +191,7 @@ public final class ApacheHttpClientChannels {
                     apacheClient,
                     clientName,
                     pool,
+                    connectionConfigResolver,
                     connectionEvictorFuture,
                     leakDetector,
                     executor,
@@ -227,6 +229,8 @@ public final class ApacheHttpClientChannels {
         abstract ExecutorService executor();
 
         abstract ResponseLeakDetector leakDetector();
+
+        abstract DialogueConnectionConfigResolver connectionConfigResolver();
     }
 
     private static final class CloseableClientWrapper extends CloseableClient {
@@ -264,6 +268,11 @@ public final class ApacheHttpClientChannels {
         }
 
         @Override
+        DialogueConnectionConfigResolver connectionConfigResolver() {
+            return delegate.connectionConfigResolver();
+        }
+
+        @Override
         public void close() throws IOException {
             delegate.close();
         }
@@ -280,6 +289,7 @@ public final class ApacheHttpClientChannels {
         private final String clientName;
         private final CloseableHttpClient apacheClient;
         private final InstrumentedPoolingHttpClientConnectionManager pool;
+        private final DialogueConnectionConfigResolver connectionConfigResolver;
         private final ResponseLeakDetector leakDetector;
         private final ClientConfiguration clientConfiguration;
 
@@ -292,6 +302,7 @@ public final class ApacheHttpClientChannels {
                 CloseableHttpClient apacheClient,
                 @Safe String clientName,
                 InstrumentedPoolingHttpClientConnectionManager pool,
+                DialogueConnectionConfigResolver connectionConfigResolver,
                 ScheduledFuture<?> connectionEvictorFuture,
                 ResponseLeakDetector leakDetector,
                 @Nullable ExecutorService executor,
@@ -299,6 +310,7 @@ public final class ApacheHttpClientChannels {
             this.clientName = clientName;
             this.apacheClient = apacheClient;
             this.pool = pool;
+            this.connectionConfigResolver = connectionConfigResolver;
             this.leakDetector = leakDetector;
             this.executor = executor;
             this.clientConfiguration = clientConfiguration;
@@ -333,6 +345,11 @@ public final class ApacheHttpClientChannels {
         @Override
         ResponseLeakDetector leakDetector() {
             return leakDetector;
+        }
+
+        @Override
+        DialogueConnectionConfigResolver connectionConfigResolver() {
+            return connectionConfigResolver;
         }
 
         @Override
@@ -561,7 +578,14 @@ public final class ApacheHttpClientChannels {
             CloseableHttpClient apacheClient = builder.build();
             ScheduledFuture<?> connectionEvictorFuture =
                     ScheduledIdleConnectionEvictor.schedule(connectionManager, Duration.ofSeconds(5));
-            return CloseableClient.wrap(apacheClient, name, connectionManager, connectionEvictorFuture, conf, executor);
+            return CloseableClient.wrap(
+                    apacheClient,
+                    name,
+                    connectionManager,
+                    connectionConfigResolver,
+                    connectionEvictorFuture,
+                    conf,
+                    executor);
         }
     }
 
